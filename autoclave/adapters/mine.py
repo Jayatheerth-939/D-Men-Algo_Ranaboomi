@@ -1,99 +1,105 @@
-import time
+"""Multi-start insertion search for the Autoclave Queue challenge."""
+
 import random
+import time
+
 from adapter import Solver, cost_of
+
 
 class MySolver(Solver):
     def solve(self, instance, submit_candidate):
-        start_time = time.time()
-        time_budget = 4.85  # Maximize the 5-second time limit ⏱️
-        
-        # 1. Expanded pool of smart starting heuristics 🧠📦
-        orders = [
-            sorted(range(instance.size), key=lambda b: (instance.fam[b], instance.due[b])),
-            sorted(range(instance.size), key=lambda b: (instance.release[b], instance.due[b])),
-            sorted(range(instance.size), key=lambda b: (instance.due[b], b)),
-            sorted(range(instance.size), key=lambda b: (instance.weight[b] * -1, instance.due[b])),
-            sorted(range(instance.size), key=lambda b: (instance.due[b] - instance.release[b], b))
+        started = time.perf_counter()
+        deadline = started + 4.65
+        n = instance.size
+        ids = list(range(n))
+        rng = random.Random(str(instance.digest) + ":3")
+
+        if n == 0:
+            return {"order": []}
+
+        # Start with several useful priorities. Weighted slack helps bring
+        # urgent, high-penalty batches forward, especially in tight instances.
+        starts = [
+            sorted(ids, key=lambda b: (instance.fam[b], instance.due[b], b)),
+            sorted(ids, key=lambda b: (instance.release[b], instance.due[b], b)),
+            sorted(ids, key=lambda b: (instance.due[b], b)),
+            sorted(ids, key=lambda b: (instance.weight[b], instance.due[b], b)),
+            sorted(ids, key=lambda b: ((instance.due[b] - instance.release[b] - instance.proc[b]) / instance.weight[b], instance.due[b], b)),
+            sorted(ids, key=lambda b: (instance.due[b] / instance.weight[b], instance.due[b], b)),
         ]
-        
-        best_order = orders[0]
+
+        best_order = list(starts[0])
         best_cost = cost_of(instance, best_order)
         submit_candidate({"order": best_order})
-        
-        for initial_order in orders[1:]:
-            cost = cost_of(instance, initial_order)
-            if cost < best_cost:
-                best_cost = cost
-                best_order = initial_order
+        for order in starts[1:]:
+            c = cost_of(instance, order)
+            if c < best_cost:
+                best_order, best_cost = list(order), c
                 submit_candidate({"order": best_order})
-                
+
         current_order = list(best_order)
         current_cost = best_cost
-        
-        # 2. Advanced Local Search with Dual Neighborhoods (Relocate + 2-Opt) 🔄🛠️
-        while (time.time() - start_time) < time_budget:
+        restart_count = 0
+
+        while time.perf_counter() < deadline:
             improved = False
-            
-            # Neighborhood A: Relocate (Shift) 🚚
-            indices = list(range(instance.size))
-            if instance.size > 40:
-                random.shuffle(indices)
-                indices = indices[:min(instance.size, 50)]
-                
-            for i in indices:
-                if (time.time() - start_time) >= time_budget:
+            positions = list(range(n))
+            if n > 50:
+                rng.shuffle(positions)
+                positions = positions[:45]
+
+            # First-improvement relocate search, matching the reliable core of
+            # your current solver while varying scan order between passes.
+            for i in positions:
+                if time.perf_counter() >= deadline:
                     break
-                for j in indices:
+                for j in positions:
                     if i == j:
                         continue
-                        
-                    candidate_order = list(current_order)
-                    item = candidate_order.pop(i)
-                    candidate_order.insert(j, item)
-                    
-                    cost = cost_of(instance, candidate_order)
-                    if cost < current_cost:
-                        current_cost = cost
-                        current_order = candidate_order
-                        if current_cost < best_cost:
-                            best_cost = current_cost
-                            best_order = list(current_order)
-                            submit_candidate({"order": best_order})
+                    candidate = list(current_order)
+                    item = candidate.pop(i)
+                    candidate.insert(j, item)
+                    c = cost_of(instance, candidate)
+                    if c < current_cost:
+                        current_order, current_cost = candidate, c
                         improved = True
                         break
                 if improved:
                     break
-            
-            # Neighborhood B: 2-Opt (Sub-segment Reversal) 🔄 if Relocate didn't improve
-            if not improved and instance.size >= 6:
-                for i in range(instance.size - 3):
-                    if (time.time() - start_time) >= time_budget:
+
+            # Try some swaps too; they can cross plateaus where one insertion
+            # at a time cannot improve the plan.
+            if not improved and time.perf_counter() < deadline:
+                for _ in range(80):
+                    i, j = rng.sample(range(n), 2)
+                    candidate = list(current_order)
+                    candidate[i], candidate[j] = candidate[j], candidate[i]
+                    c = cost_of(instance, candidate)
+                    if c < current_cost:
+                        current_order, current_cost = candidate, c
+                        improved = True
                         break
-                    for j in range(i + 3, min(instance.size, i + 25)):
-                        candidate_order = list(current_order)
-                        candidate_order[i:j] = reversed(candidate_order[i:j])
-                        
-                        cost = cost_of(instance, candidate_order)
-                        if cost < current_cost:
-                            current_cost = cost
-                            current_order = candidate_order
-                            if current_cost < best_cost:
-                                best_cost = current_cost
-                                best_order = list(current_order)
-                                submit_candidate({"order": best_order})
-                            improved = True
-                            break
-                    if improved:
+                    if time.perf_counter() >= deadline:
                         break
-            
-            # Perturbation / Shake if trapped in a local minimum 🌪️✨
+
+            if current_cost < best_cost:
+                best_order, best_cost = list(current_order), current_cost
+                submit_candidate({"order": best_order})
+
             if not improved:
-                if len(current_order) > 5:
-                    for _ in range(3):
-                        idx1, idx2 = random.sample(range(instance.size), 2)
-                        current_order[idx1], current_order[idx2] = current_order[idx2], current_order[idx1]
-                    current_cost = cost_of(instance, current_order)
-                else:
-                    break
-                    
+                # Periodically restart near the global best, with a larger
+                # shake each time instead of letting the search drift randomly.
+                restart_count += 1
+                current_order = list(best_order)
+                shake_count = 1 + (restart_count % 6)
+                for _ in range(shake_count):
+                    i = rng.randrange(n)
+                    if n > 1:
+                        distance = rng.randint(1, min(8, n - 1))
+                        j = max(0, min(n - 1, i + (distance if rng.random() < 0.5 else -distance)))
+                        if i != j:
+                            item = current_order.pop(i)
+                            current_order.insert(j, item)
+                current_cost = cost_of(instance, current_order)
+
         return {"order": best_order}
